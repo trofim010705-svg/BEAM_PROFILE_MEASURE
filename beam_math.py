@@ -1,8 +1,9 @@
 """Beam analysis: 1/e² Gaussian diameters from a USB camera frame.
 
-The Gaussian fits operate on *integrated* horizontal/vertical profiles rather
-than only on the central row. Inputs should be linear, unsaturated, unprocessed
-sensor data where possible. Outputs are optical 1/e² diameters, not FWHM.
+The Gaussian fits operate on integrated horizontal and vertical profiles with
+a separate linear background on each axis. Inputs should be linear,
+unsaturated, unprocessed sensor data where possible. Outputs are optical
+1/e² diameters, not FWHM.
 """
 from __future__ import annotations
 
@@ -23,7 +24,13 @@ class AxisFit:
     diameter_px: float
     r_squared: float
     amplitude: float
-    offset: float
+    offset: float  # Linear background value at the midpoint of x.
+    slope: float = 0.0
+
+    @property
+    def baseline(self) -> np.ndarray:
+        midpoint = (self.x[0] + self.x[-1]) / 2
+        return self.offset + self.slope * (self.x - midpoint)
 
 
 @dataclass
@@ -71,41 +78,67 @@ def gaussian_1d(x: np.ndarray, amplitude: float, center: float,
     return amplitude * np.exp(-2.0 * ((x - center) / radius) ** 2) + offset
 
 
+def gaussian_with_baseline(x: np.ndarray, amplitude: float, center: float,
+                           radius: float, offset: float, slope: float) -> np.ndarray:
+    """The model uses coordinates centered at the middle of the profile."""
+    return gaussian_1d(x, amplitude, center, radius, offset) + slope * x
+
+
 def fit_axis(x: np.ndarray, values: np.ndarray) -> Optional[AxisFit]:
     vals = np.asarray(values, dtype=np.float64)
     pos = np.asarray(x, dtype=np.float64)
-    if len(vals) < 12 or not np.all(np.isfinite(vals)):
+    if vals.ndim != 1 or vals.shape != pos.shape or len(vals) < 12:
+        return None
+    if not np.all(np.isfinite(vals)) or not np.all(np.isfinite(pos)) or np.any(np.diff(pos) <= 0):
         return None
 
-    baseline = float(np.percentile(vals, 10))
-    weights = np.clip(vals - baseline, 0, None)
-    total = float(np.sum(weights))
-    if total <= 0 or float(vals.max() - baseline) < 1:
+    midpoint = (pos[0] + pos[-1]) / 2
+    centered_x = pos - midpoint
+    span = pos[-1] - pos[0] + 1
+
+    # Estimate the initial line from the wings, then seed the peak above it.
+    edge_count = max(2, len(vals) // 10)
+    left_x = np.median(centered_x[:edge_count])
+    right_x = np.median(centered_x[-edge_count:])
+    left_y = np.median(vals[:edge_count])
+    right_y = np.median(vals[-edge_count:])
+    slope0 = (right_y - left_y) / (right_x - left_x)
+    offset0 = left_y - slope0 * left_x
+    detrended = vals - (offset0 + slope0 * centered_x)
+    amp0 = float(detrended.max())
+    if amp0 <= 1:
         return None
-    center0 = float(np.sum(pos * weights) / total)
-    variance = float(np.sum((pos - center0) ** 2 * weights) / total)
-    radius0 = max(2., min(2 * np.sqrt(max(variance, 1.)), len(vals) * 1.5))
-    amp0 = max(float(vals.max() - baseline), 1e-5)
+
+    weights = np.maximum(detrended - 0.05 * amp0, 0)
+    total = float(np.sum(weights))
+    center0 = float(np.sum(centered_x * weights) / total)
+    variance = float(np.sum((centered_x - center0) ** 2 * weights) / total)
+    radius0 = min(2 * np.sqrt(max(variance, 1.)), span * 1.5)
 
     try:
         params, _ = curve_fit(
-            gaussian_1d, pos, vals,
-            p0=[amp0, center0, radius0, max(0, baseline)],
+            gaussian_with_baseline, centered_x, vals,
+            p0=[amp0, center0, radius0, offset0, slope0],
             bounds=(
-                [0, pos[0] - len(pos), 0.7, 0],
-                [np.inf, pos[-1] + len(pos), 2.0 * len(pos), np.inf],
+                [0, centered_x[0] - span, 0.7, -np.inf, -np.inf],
+                [np.inf, centered_x[-1] + span, 2.0 * span, np.inf, np.inf],
             ),
             maxfev=3000,
         )
     except (RuntimeError, ValueError, FloatingPointError):
         return None
-    amp, center, radius, offset = (float(v) for v in params)
-    modeled = gaussian_1d(pos, *params)
+    amp, center, radius, offset, slope = (float(v) for v in params)
+    if amp <= 1:
+        return None
+    modeled = gaussian_with_baseline(centered_x, *params)
     ss_res = np.sum((vals - modeled) ** 2)
-    ss_tot = np.sum((vals - np.mean(vals)) ** 2)
+    # Measure fit quality on the beam signal so that a large slope cannot
+    # make an inaccurate Gaussian look like a good fit.
+    signal = vals - (offset + slope * centered_x)
+    ss_tot = np.sum((signal - np.mean(signal)) ** 2)
     r2 = float(1 - ss_res / ss_tot) if ss_tot > 0 else 0.0
-    return AxisFit(pos, vals, modeled, center, radius, 2 * radius,
-                   r2, amp, offset)
+    return AxisFit(pos, vals, modeled, float(center + midpoint), radius,
+                   2 * radius, r2, amp, offset, slope)
 
 
 def analyze_frame(
@@ -144,14 +177,16 @@ def analyze_frame(
         corrected[:, :bx].ravel(), corrected[:, -bx:].ravel(),
     ])
     bg = float(np.median(rim))
-    corrected = np.maximum(corrected - bg, 0).astype(np.float32)
-    peak = float(corrected.max())
+    corrected -= bg
+    corrected_roi = np.maximum(corrected, 0).astype(np.float32, copy=False)
+    peak = float(corrected_roi.max())
 
     saturated = (source >= saturation_threshold)
     satcount = int(np.count_nonzero(saturated))
     satpercent = satcount / source.size * 100.0
 
-    # Axes use absolute camera pixel coordinates.
+    # Retain signed samples in the projections. Clipping the low side of a
+    # tilted background would change the line the fit has to subtract.
     xx = np.arange(x0, x1, dtype=np.float64)
     yy = np.arange(y0, y1, dtype=np.float64)
     x_profile = corrected.sum(axis=0, dtype=np.float64)
@@ -176,9 +211,7 @@ def analyze_frame(
             if fit.diameter_px < 6:
                 warnings.append(f"Пятно менее 6 пикселей по {axis}")
 
-    reliable = (satcount == 0 and fx is not None and fy is not None and
-                fx.r_squared >= .98 and fy.r_squared >= .98 and
-                not any("обрезает" in s for s in warnings) and peak >= 8)
-    return BeamAnalysis((x0, y0, x1, y1), corrected, source, saturated,
+    reliable = not warnings
+    return BeamAnalysis((x0, y0, x1, y1), corrected_roi, source, saturated,
                         satcount, satpercent, bg, peak, fx, fy,
                         "; ".join(warnings), reliable)

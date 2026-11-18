@@ -271,8 +271,9 @@ class App:
         self.gain = tk.StringVar(value="0")
         self.camera_readback = tk.StringVar(value=NO_CAMERA_READBACK)
         self.camera_control_result = tk.StringVar(value="")
-        self.diameter_x = tk.StringVar(value="—")
-        self.diameter_y = tk.StringVar(value="—")
+        self.radius_x = tk.StringVar(value="—")
+        self.radius_y = tk.StringVar(value="—")
+        self.fit_quality = tk.StringVar(value="Фит: —")
         self.center_text = tk.StringVar(value="Центр: —")
         self.fit_text = tk.StringVar(value="R²: —")
         self.sat_text = tk.StringVar(value="Насыщение: —")
@@ -369,11 +370,12 @@ class App:
 
         metrics = ttk.Frame(self.root, style="Top.TFrame", padding=(12, 5))
         metrics.pack(fill=tk.X)
-        for title, var in [("Dₓ (1/e²):", self.diameter_x), ("Dᵧ (1/e²):", self.diameter_y)]:
+        for title, var in [("Радиус X (1/e²)", self.radius_x), ("Радиус Y (1/e²)", self.radius_y)]:
             cell = ttk.Frame(metrics, style="Top.TFrame")
             cell.pack(side=tk.LEFT, padx=(0, 25))
             ttk.Label(cell, text=title, style="Top.TLabel").pack(anchor=tk.W)
             ttk.Label(cell, textvariable=var, style="Metric.TLabel").pack(anchor=tk.W)
+        ttk.Label(metrics, textvariable=self.fit_quality, style="Top.TLabel").pack(side=tk.LEFT, padx=(0, 8))
         ttk.Label(metrics, textvariable=self.center_text, style="Top.TLabel").pack(side=tk.LEFT, padx=12)
         ttk.Label(metrics, textvariable=self.fit_text, style="Top.TLabel").pack(side=tk.LEFT, padx=12)
         ttk.Label(metrics, textvariable=self.sat_text, style="Top.TLabel").pack(side=tk.LEFT, padx=12)
@@ -394,6 +396,14 @@ class App:
             ax.set_title(title)
         self.plot_canvas.draw_idle()
 
+    def clear_measurement_metrics(self):
+        self.radius_x.set("—")
+        self.radius_y.set("—")
+        self.fit_quality.set("Фит: —")
+        self.center_text.set("Центр: —")
+        self.fit_text.set("R²: —")
+        self.sat_text.set("Насыщение: —")
+
     def clear_stream(self, message: str):
         self.last_frame = None
         self.last_result = None
@@ -407,11 +417,7 @@ class App:
         self.fps_counter = 0
         self.fps_start = time.monotonic()
         self.stream_fps = 0.0
-        self.diameter_x.set("—")
-        self.diameter_y.set("—")
-        self.center_text.set("Центр: —")
-        self.fit_text.set("R²: —")
-        self.sat_text.set("Насыщение: —")
+        self.clear_measurement_metrics()
         self.stream_info.set(message)
         self.video_canvas.delete("all")
         self.image_photo = None
@@ -640,26 +646,25 @@ class App:
                                    saturation_threshold=float(self.sat_level.get()))
         except (ValueError, TypeError, tk.TclError) as exc:
             self.last_result = None
-            self.diameter_x.set("—")
-            self.diameter_y.set("—")
+            self.clear_measurement_metrics()
             self.status(f"Измерение: {exc}")
             return
         self.last_result = result
         try:
             pitch = parse_optional_float(self.pixel_pitch.get())
-            if pitch is not None and (pitch <= 0 or pitch > 1000):
+            if pitch is not None and not 0 < pitch <= 1000:
                 raise ValueError("Масштаб должен быть положительным и <= 1000 мкм/px")
         except ValueError:
             pitch = None
             self.status("Неверный масштаб (мкм/px): показываю пиксели")
         unit = "мкм" if pitch is not None else "px"
         factor = pitch if pitch is not None else 1.0
-        if result.fit_reliable and result.x_fit and result.y_fit:
-            self.diameter_x.set(f"{result.x_fit.diameter_px * factor:.1f} {unit}")
-            self.diameter_y.set(f"{result.y_fit.diameter_px * factor:.1f} {unit}")
+        for value, fit in ((self.radius_x, result.x_fit), (self.radius_y, result.y_fit)):
+            value.set(f"{fit.radius_px * factor:.1f} {unit}" if fit is not None else "—")
+        if result.x_fit is None and result.y_fit is None:
+            self.fit_quality.set("Фит: нет оценки")
         else:
-            self.diameter_x.set("недостоверно")
-            self.diameter_y.set("недостоверно")
+            self.fit_quality.set("Фит: достоверно" if result.fit_reliable else "Фит: недостоверно")
         if result.x_fit and result.y_fit:
             self.center_text.set(f"Центр: ({result.x_fit.center_px:.1f}, {result.y_fit.center_px:.1f}) px")
             self.fit_text.set(f"R²: X={result.x_fit.r_squared:.4f} Y={result.y_fit.r_squared:.4f}")
@@ -668,9 +673,9 @@ class App:
             self.fit_text.set("R²: —")
         self.sat_text.set(f"≥ порога: {result.saturated_count} px ({result.saturation_percent:.3f}%)")
         if result.warning:
-            self.status(result.warning + " · не доверяй диаметру до устранения проблем")
+            self.status(result.warning)
         elif not self.demo:
-            self.status("Измерение: OK · диаметр по 1/e² · для мкм введи калиброванный масштаб пикселя")
+            self.status("Гауссов фит прошёл проверки")
         if time.monotonic() - self.last_plot_time > .3:
             self.refresh_plots(result, pitch)
             self.last_plot_time = time.monotonic()
@@ -727,7 +732,9 @@ class App:
                 xx = fit.x * factor
                 ax.plot(xx, fit.y, color="#245c9e", linewidth=1.5, label="Данные")
                 ax.plot(xx, fit.fitted, color="#db612a", linestyle="--", linewidth=2,
-                        label="Гаусс")
+                        label="Гаусс + фон")
+                ax.plot(xx, fit.baseline, color="#697386", linestyle=":", linewidth=1.5,
+                        label="Линейный фон")
                 title = f"{label}: D = {fit.diameter_px * factor:.1f} {unit}"
                 if not result.fit_reliable:
                     title += " (недостоверно)"
@@ -796,6 +803,11 @@ class App:
             "fit_reliable": result.fit_reliable,
             "warnings": result.warning,
             "background_level": result.background,
+            "profile_model": "Gaussian plus linear background",
+            "radius_x_px": result.x_fit.radius_px if result.x_fit else None,
+            "radius_y_px": result.y_fit.radius_px if result.y_fit else None,
+            "radius_x_um": result.x_fit.radius_px * pitch if pitch and result.x_fit else None,
+            "radius_y_um": result.y_fit.radius_px * pitch if pitch and result.y_fit else None,
             "diameter_x_px": result.x_fit.diameter_px if result.x_fit else None,
             "diameter_y_px": result.y_fit.diameter_px if result.y_fit else None,
             "diameter_x_um": result.x_fit.diameter_px * pitch if pitch and result.x_fit else None,
@@ -812,9 +824,9 @@ class App:
                 continue
             with open(str(base) + f"_profile_{tag}.csv", "w", newline="", encoding="utf-8-sig") as f:
                 writer = csv.writer(f)
-                writer.writerow(["coordinate_pixel", "coordinate_um", "intensity_sum", "gaussian_fit"])
-                for x, y, yf in zip(fit.x, fit.y, fit.fitted):
-                    writer.writerow([float(x), float(x * pitch) if pitch else "", float(y), float(yf)])
+                writer.writerow(["coordinate_pixel", "coordinate_um", "intensity_sum", "gaussian_fit", "linear_background"])
+                for x, y, yf, baseline in zip(fit.x, fit.y, fit.fitted, fit.baseline):
+                    writer.writerow([float(x), float(x * pitch) if pitch else "", float(y), float(yf), float(baseline)])
         self.refresh_plots(result, pitch)
         self.last_plot_time = time.monotonic()
         self.figure.savefig(str(base) + "_plots.png", dpi=160)
