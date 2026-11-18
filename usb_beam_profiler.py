@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 import queue
 import sys
 import threading
@@ -27,6 +28,7 @@ from beam_math import BeamAnalysis, analyze_frame, extract_channel
 
 
 APP_TITLE = "USB Laser Beam Profiler | 780 nm"
+NO_CAMERA_READBACK = "Выдержка (Exposure): — · Усиление (Gain): —"
 
 
 def parse_optional_float(text: str) -> float | None:
@@ -40,6 +42,7 @@ class CameraWorker(threading.Thread):
     retry_delay = 2.0
     read_retry_delay = 0.06
     read_failure_limit = 5
+    readback_interval = 1.0
 
     def __init__(self, index: int, backend: int, resolution: tuple[int, int],
                  out_queue: queue.Queue, cmd_queue: queue.Queue, event_queue: queue.Queue):
@@ -63,25 +66,59 @@ class CameraWorker(threading.Thread):
                 pass
             q.put_nowait(value)
 
-    def apply_control(self, cap, cmd, value):
+    @staticmethod
+    def read_property(cap, prop):
+        try:
+            value = cap.get(prop)
+        except cv2.error:
+            return None
+        return value if math.isfinite(value) else None
+
+    def report_readback(self, cap, backend_name):
+        exposure = self.read_property(cap, cv2.CAP_PROP_EXPOSURE)
+        gain = self.read_property(cap, cv2.CAP_PROP_GAIN)
+        if exposure is None:
+            exposure_text = "недоступна"
+        elif exposure in (-1, 0):
+            exposure_text = f"{exposure:g} (может означать отсутствие данных)"
+        else:
+            exposure_text = f"{exposure:g}"
+        gain_text = "—" if gain is None or gain == -1 else f"{gain:g}"
+        qualifier = "значения по умолчанию" if backend_name == "MSMF" else "данные драйвера"
+        self.event_queue.put(("camera_readback", f"{backend_name} · Выдержка (Exposure): {exposure_text} · Усиление (Gain): {gain_text} · {qualifier}"))
+
+    def apply_control(self, cap, backend_name, cmd, value):
         prop = {
             "auto_exposure": cv2.CAP_PROP_AUTO_EXPOSURE,
             "exposure": cv2.CAP_PROP_EXPOSURE,
             "gain": cv2.CAP_PROP_GAIN,
         }[cmd]
-        try:
-            if cmd == "auto_exposure":
-                # OpenCV interprets these values according to the selected backend.
-                ok = cap.set(prop, 0.75 if value else 0.25)
-                message = f"Auto exposure: запрос {'вкл.' if value else 'выкл.'}; ответ драйвера: {ok}"
+        if cmd == "auto_exposure":
+            if backend_name == "MSMF" and not value:
+                # MSMF would set Exposure to zero (one second) along with manual mode.
+                self.event_queue.put(("control_result", "Media Foundation: для ручного режима задай Exposure"))
+                return False
+            request = f"Автоэкспозиция {'вкл.' if value else 'выкл.'}"
+            if backend_name in ("DSHOW", "MSMF"):
+                setting = float(value)
             else:
-                ok = cap.set(prop, float(value))
-                message = f"{cmd.capitalize()}: запрос {value}; ответ драйвера: {ok}; чтение: {cap.get(prop):g}"
+                setting = 0.75 if value else 0.25
+        else:
+            request = f"{cmd.capitalize()} {value:g}"
+            setting = float(value)
+        try:
+            ok = cap.set(prop, setting)
         except cv2.error:
-            message = f"Драйвер не применил настройку {cmd}"
-        self.event_queue.put(("info", message))
+            ok = False
+        response = "драйвер принял запрос" if ok else "драйвер отклонил запрос"
+        self.event_queue.put(("control_result", f"{request} · {response}"))
+        return ok
 
     def capture_frames(self, cap, controls) -> str:
+        try:
+            backend_name = cap.getBackendName()
+        except cv2.error:
+            backend_name = "Камера"
         width, height = self.resolution
         for prop, value in ((cv2.CAP_PROP_FRAME_WIDTH, width),
                             (cv2.CAP_PROP_FRAME_HEIGHT, height),
@@ -92,19 +129,23 @@ class CameraWorker(threading.Thread):
             except cv2.error:
                 pass
         for cmd, value in controls.items():
-            self.apply_control(cap, cmd, value)
+            self.apply_control(cap, backend_name, cmd, value)
 
         streaming = False
         failures = 0
+        next_readback = 0.0
         while not self.please_stop.is_set():
             while not self.please_stop.is_set():
                 try:
                     cmd, value = self.cmd_queue.get_nowait()
                 except queue.Empty:
                     break
-                controls.pop(cmd, None)
-                controls[cmd] = value
-                self.apply_control(cap, cmd, value)
+                if self.apply_control(cap, backend_name, cmd, value):
+                    controls.pop(cmd, None)
+                    if cmd == "auto_exposure" and value:
+                        controls.pop("exposure", None)
+                    controls[cmd] = value
+                next_readback = 0.0
             if self.please_stop.is_set():
                 break
             ok, frame = cap.read()
@@ -126,7 +167,11 @@ class CameraWorker(threading.Thread):
                 self.event_queue.put(("streaming", f"Камера {self.index}: получен кадр {width}×{height} px"))
                 streaming = True
             failures = 0
-            self.put_latest(self.out_queue, (time.monotonic(), frame))
+            now = time.monotonic()
+            self.put_latest(self.out_queue, (now, frame))
+            if now >= next_readback:
+                self.report_readback(cap, backend_name)
+                next_readback = now + self.readback_interval
         return f"Нет кадров с камеры {self.index}"
 
     def run(self):
@@ -218,9 +263,10 @@ class App:
         self.channel = tk.StringVar(value="Red")
         self.pixel_pitch = tk.StringVar(value="")
         self.sat_level = tk.IntVar(value=250)
-        self.auto_exp = tk.BooleanVar(value=False)
         self.exposure = tk.StringVar(value="-7")
         self.gain = tk.StringVar(value="0")
+        self.camera_readback = tk.StringVar(value=NO_CAMERA_READBACK)
+        self.camera_control_result = tk.StringVar(value="")
         self.diameter_x = tk.StringVar(value="—")
         self.diameter_y = tk.StringVar(value="—")
         self.center_text = tk.StringVar(value="Центр: —")
@@ -277,17 +323,21 @@ class App:
 
         exp_bar = ttk.Frame(self.root, style="Top.TFrame", padding=(10, 0, 10, 8))
         exp_bar.pack(side=tk.TOP, fill=tk.X)
-        ttk.Label(exp_bar, text="Ручные параметры UVC (если поддерживаются):", style="Top.TLabel").pack(side=tk.LEFT)
-        ttk.Checkbutton(exp_bar, text="Автоэкспозиция", variable=self.auto_exp,
-                        command=self.request_auto_exposure).pack(side=tk.LEFT, padx=7)
+        ttk.Label(exp_bar, text="Автоэкспозиция", style="Top.TLabel").pack(side=tk.LEFT)
+        ttk.Button(exp_bar, text="Включить авто", command=lambda: self.request_auto_exposure(True)).pack(side=tk.LEFT, padx=5)
+        ttk.Button(exp_bar, text="Выключить авто", command=lambda: self.request_auto_exposure(False)).pack(side=tk.LEFT, padx=(0, 14))
         ttk.Label(exp_bar, text="Exposure", style="Top.TLabel").pack(side=tk.LEFT)
         ttk.Entry(exp_bar, textvariable=self.exposure, width=7).pack(side=tk.LEFT, padx=5)
         ttk.Button(exp_bar, text="Задать", command=self.request_exposure).pack(side=tk.LEFT)
         ttk.Label(exp_bar, text="Gain", style="Top.TLabel").pack(side=tk.LEFT, padx=(12, 3))
         ttk.Entry(exp_bar, textvariable=self.gain, width=7).pack(side=tk.LEFT, padx=5)
         ttk.Button(exp_bar, text="Задать", command=self.request_gain).pack(side=tk.LEFT)
-        ttk.Label(exp_bar, text="Значения зависят от драйвера", style="Top.TLabel",
-                  foreground="#667085").pack(side=tk.LEFT, padx=10)
+
+        readback_bar = ttk.Frame(self.root, style="Top.TFrame", padding=(10, 0, 10, 8))
+        readback_bar.pack(side=tk.TOP, fill=tk.X)
+        ttk.Label(readback_bar, textvariable=self.camera_readback, style="Top.TLabel").pack(anchor=tk.W)
+        ttk.Label(readback_bar, textvariable=self.camera_control_result, style="Top.TLabel",
+                  foreground="#667085").pack(anchor=tk.W)
 
         content = ttk.Panedwindow(self.root, orient=tk.HORIZONTAL)
         content.pack(fill=tk.BOTH, expand=True, padx=9, pady=(0, 5))
@@ -414,6 +464,11 @@ class App:
                 self.retiring_worker = self.worker
             self.worker = None
         self.camera_streaming = False
+        self.clear_camera_readback()
+
+    def clear_camera_readback(self):
+        self.camera_readback.set(NO_CAMERA_READBACK)
+        self.camera_control_result.set("")
 
     def disconnect(self):
         self.stop_camera_worker()
@@ -444,16 +499,16 @@ class App:
         self.dark_accumulator = None
         self.status("Записываю 16 тёмных кадров. Лазер должен оставаться перекрытым.")
 
-    def request_auto_exposure(self):
+    def request_auto_exposure(self, enabled):
         if self.worker is not None:
-            self.cmd_queue.put(("auto_exposure", self.auto_exp.get()))
+            self.cmd_queue.put(("auto_exposure", enabled))
         else:
             self.status("Подключи камеру для управления экспозицией")
 
     def request_exposure(self):
         try:
             v = parse_optional_float(self.exposure.get())
-            if v is None:
+            if v is None or not math.isfinite(v):
                 raise ValueError()
         except ValueError:
             self.status("Некорректное значение Exposure")
@@ -466,7 +521,7 @@ class App:
     def request_gain(self):
         try:
             v = parse_optional_float(self.gain.get())
-            if v is None:
+            if v is None or not math.isfinite(v):
                 raise ValueError()
         except ValueError:
             self.status("Некорректное значение Gain")
@@ -518,10 +573,17 @@ class App:
                     event, msg = self.events.get_nowait()
                 except queue.Empty:
                     break
+                if event == "camera_readback":
+                    self.camera_readback.set(msg)
+                    continue
+                if event == "control_result":
+                    self.camera_control_result.set(msg)
+                    continue
                 if event == "retrying":
                     if self.camera_streaming or self.stream_info.get() != msg:
                         self.clear_stream(msg)
                     self.camera_streaming = False
+                    self.clear_camera_readback()
                 elif event == "streaming":
                     self.camera_streaming = True
                 self.status(msg)
