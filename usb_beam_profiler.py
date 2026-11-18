@@ -99,7 +99,11 @@ class CameraWorker(threading.Thread):
                 self.event_queue.put(("control_result", "Media Foundation: для ручного режима задай Exposure"))
                 return False
             request = f"Автоэкспозиция {'вкл.' if value else 'выкл.'}"
-            if backend_name in ("DSHOW", "MSMF"):
+            if backend_name == "MSMF":
+                # MSMF forwards this value to Set as a long and also tests it for
+                # nonzero to select auto mode. Use the driver's default in range.
+                setting = self.read_property(cap, cv2.CAP_PROP_EXPOSURE) or 0.5
+            elif backend_name == "DSHOW":
                 setting = float(value)
             else:
                 setting = 0.75 if value else 0.25
