@@ -21,7 +21,8 @@ jobs:
           python-version: '3.12'
           architecture: x64
       - name: Install dependencies
-        run: python -m pip install --only-binary=:all: -r requirements.txt "pyinstaller>=6.15,<7" "pytest>=8,<10"
+        run: |
+          python -m pip install --only-binary=:all: -r requirements.txt "pyinstaller>=6.15,<7" "pytest>=8,<10"
       - name: Test numerical analysis
         run: python -m pytest tests -q
       - name: Package the application
