@@ -1,0 +1,80 @@
+name: Build Windows executable
+
+on:
+  push:
+    branches: [windows-build]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 25
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          architecture: x64
+      - name: Install dependencies
+        run: python -m pip install --only-binary=:all: -r requirements.txt "pyinstaller>=6.15,<7" "pytest>=8,<10"
+      - name: Test numerical analysis
+        run: python -m pytest tests -q
+      - name: Package the application
+        run: python -m PyInstaller --noconfirm --clean --onefile --windowed --noupx --name USB_Laser_Beam_Profiler usb_beam_profiler.py
+      - name: Verify the packaged demo opens
+        shell: pwsh
+        run: |
+          $exe = (Resolve-Path 'dist\USB_Laser_Beam_Profiler.exe').Path
+          $launcher = Start-Process -FilePath $exe -ArgumentList '--demo' -PassThru
+          try {
+            $deadline = (Get-Date).AddSeconds(90)
+            $window = $null
+            do {
+              $launcher.Refresh()
+              if ($launcher.HasExited) {
+                throw "The demo exited before opening its window (exit $($launcher.ExitCode))."
+              }
+              $window = Get-Process -Name USB_Laser_Beam_Profiler -ErrorAction SilentlyContinue |
+                Where-Object { $_.Path -eq $exe -and $_.MainWindowTitle -like 'USB Laser Beam Profiler*' } |
+                Select-Object -First 1
+              if ($window) { break }
+              Start-Sleep -Milliseconds 500
+            } while ((Get-Date) -lt $deadline)
+            if (!$window) { throw 'The packaged demo did not open a window.' }
+            Start-Sleep -Seconds 3
+            $window.Refresh()
+            if ($window.HasExited -or !$window.Responding) { throw 'The demo window stopped responding.' }
+            Write-Host "Opened $($window.MainWindowTitle)"
+            if ($window.CloseMainWindow() -and !$launcher.WaitForExit(10000)) {
+              throw 'The packaged demo did not close.'
+            }
+          } finally {
+            Get-Process -Name USB_Laser_Beam_Profiler -ErrorAction SilentlyContinue |
+              Where-Object { $_.Path -eq $exe } |
+              Stop-Process -Force -ErrorAction SilentlyContinue
+          }
+      - name: Record SHA-256
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash 'dist\USB_Laser_Beam_Profiler.exe' -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  USB_Laser_Beam_Profiler.exe" | Set-Content 'dist\SHA256SUMS.txt' -Encoding ascii
+      - uses: actions/upload-artifact@v4
+        with:
+          name: USB_Laser_Beam_Profiler-Windows-x64
+          path: |
+            dist/USB_Laser_Beam_Profiler.exe
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+      - name: Publish Windows release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "windows-x64-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          gh release create $tag 'dist/USB_Laser_Beam_Profiler.exe' 'dist/SHA256SUMS.txt' --repo "$env:GITHUB_REPOSITORY" --target "$env:GITHUB_SHA" --title 'USB Laser Beam Profiler for Windows x64' --notes 'Portable Windows x64 build with automatic camera reconnection. The executable is unsigned. The SHA-256 checksum is attached.'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
