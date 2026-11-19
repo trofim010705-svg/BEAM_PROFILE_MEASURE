@@ -13,7 +13,6 @@ import queue
 import sys
 import threading
 import time
-from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 import tkinter as tk
@@ -25,13 +24,12 @@ from PIL import Image, ImageTk
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 
-from beam_math import BeamAnalysis, analyze_frame, extract_channel
+from beam_math import BeamAnalysis, analyze_frame
 from propagation_tab import PropagationTab
 
 
 APP_TITLE = "USB Laser Beam Profiler"
 NO_CAMERA_READBACK = "Выдержка (Exposure): — · Усиление (Gain): —"
-FPS_WINDOW_SECONDS = 1.5
 
 
 def parse_optional_float(text: str) -> float | None:
@@ -148,8 +146,6 @@ class CameraWorker(threading.Thread):
         streaming = False
         failures = 0
         next_readback = 0.0
-        rate_started = 0.0
-        frames_read = 0
         while not self.please_stop.is_set():
             while not self.please_stop.is_set():
                 try:
@@ -185,15 +181,6 @@ class CameraWorker(threading.Thread):
             failures = 0
             now = time.monotonic()
             self.put_latest(self.out_queue, (now, frame))
-            if rate_started == 0.0:
-                rate_started = now
-            else:
-                frames_read += 1
-                elapsed = now - rate_started
-                if elapsed >= FPS_WINDOW_SECONDS:
-                    self.event_queue.put(("camera_fps", frames_read / elapsed))
-                    rate_started = now
-                    frames_read = 0
             if now >= next_readback:
                 self.report_readback(cap, backend_name)
                 next_readback = now + self.readback_interval
@@ -224,50 +211,6 @@ class CameraWorker(threading.Thread):
             self.please_stop.wait(self.retry_delay)
 
 
-@dataclass(frozen=True)
-class ProfileRequest:
-    revision: int
-    frame: np.ndarray
-    roi: tuple[int, int, int, int] | None
-    channel: str
-    dark_frame: np.ndarray | None
-    saturation_threshold: float
-
-    def fit(self) -> BeamAnalysis:
-        return analyze_frame(self.frame, roi=self.roi, mode=self.channel,
-                             dark_frame=self.dark_frame,
-                             saturation_threshold=self.saturation_threshold)
-
-
-class ProfileWorker(threading.Thread):
-    """Fits immutable frame snapshots without using Tk from the worker."""
-
-    def __init__(self):
-        super().__init__(daemon=True)
-        self.requests: queue.Queue[ProfileRequest | None] = queue.Queue(maxsize=1)
-        self.results: queue.Queue[tuple[ProfileRequest, BeamAnalysis | Exception]] = queue.Queue(maxsize=1)
-        self.stopping = threading.Event()
-
-    def run(self):
-        while not self.stopping.is_set():
-            request = self.requests.get()
-            if request is None or self.stopping.is_set():
-                return
-            try:
-                result = request.fit()
-            except Exception as exc:
-                result = exc
-            if not self.stopping.is_set():
-                self.results.put_nowait((request, result))
-
-    def stop(self):
-        self.stopping.set()
-        try:
-            self.requests.put_nowait(None)
-        except queue.Full:
-            pass
-
-
 def make_synthetic_frame(t: float, w: int = 960, h: int = 600) -> np.ndarray:
     """Deliberately artificial image; used for a software check without a laser."""
     rng = np.random.default_rng(int(t * 10) % (2**32))
@@ -284,9 +227,6 @@ def make_synthetic_frame(t: float, w: int = 960, h: int = 600) -> np.ndarray:
 
 
 class App:
-    profile_interval = 1.0
-    preview_tick_ms = 30
-
     def __init__(self, root: tk.Tk, demo: bool = False):
         self.root = root
         self.root.title(APP_TITLE + (" — ДЕМО" if demo else ""))
@@ -315,19 +255,13 @@ class App:
         self.canvas_xoffset = 0
         self.canvas_yoffset = 0
         self.last_plot_time = 0.0
-        self.last_demo_time = 0.0
-        self.profile_worker = ProfileWorker()
-        self.profile_pending = False
-        self.profile_revision = 0
-        self.next_profile_time = 0.0
+        self.last_processing_time = 0.0
+        self.last_display_time = 0.0
         self.fps_counter = 0
         self.fps_start = time.monotonic()
         self.stream_fps = 0.0
-        self.camera_fps: float | None = None
         self.initialize_vars()
         self.build_ui()
-        self.profile_worker.start()
-        self.root.bind("<Destroy>", self.on_root_destroy, add=True)
         if demo:
             self.status("ДЕМО-РЕЖИМ: искусственный гауссов пучок, не реальные данные")
         else:
@@ -374,7 +308,6 @@ class App:
         self.tabs = ttk.Notebook(self.root)
         self.tabs.pack(fill=tk.BOTH, expand=True)
         camera_tab = ttk.Frame(self.tabs, style="Top.TFrame")
-        self.camera_tab = camera_tab
         self.tabs.add(camera_tab, text="Камера")
         self.propagation_tab = PropagationTab(self.tabs, self.wavelength_nm)
         self.tabs.add(self.propagation_tab, text="Фит пучка")
@@ -548,14 +481,12 @@ class App:
         self.dark_pending = 0
         self.dark_accumulator = None
         self.drag_start = None
-        self.profile_revision += 1
-        self.next_profile_time = 0.0
-        self.last_demo_time = 0.0
+        self.last_processing_time = 0.0
+        self.last_display_time = 0.0
         self.last_plot_time = 0.0
         self.fps_counter = 0
         self.fps_start = time.monotonic()
         self.stream_fps = 0.0
-        self.camera_fps = None
         self.clear_measurement_metrics()
         self.stream_info.set(message)
         self.video_canvas.delete("all")
@@ -728,9 +659,6 @@ class App:
                 if event == "control_result":
                     self.camera_control_result.set(msg)
                     continue
-                if event == "camera_fps":
-                    self.camera_fps = msg
-                    continue
                 if event == "retrying":
                     if self.camera_streaming or self.stream_info.get() != msg:
                         self.clear_stream(msg)
@@ -741,11 +669,9 @@ class App:
                 self.status(msg)
 
         now = time.monotonic()
-        camera_visible = self.tabs.select() == str(self.camera_tab)
         packet = None
-        if self.demo and camera_visible and now - self.last_demo_time >= 0.075:
+        if self.demo and now - self.last_display_time > 0.075:
             packet = (now, make_synthetic_frame(now))
-            self.last_demo_time = now
         elif self.camera_streaming:
             try:
                 packet = self.frame_queue.get_nowait()
@@ -760,6 +686,13 @@ class App:
                     self.clear_stream("Размер или формат кадра изменился")
                 self.camera_frame_shape = frame.shape
             self.last_frame = frame
+            self.fps_counter += 1
+            if now - self.fps_start >= 1.5:
+                self.stream_fps = self.fps_counter / (now - self.fps_start)
+                self.fps_start = now
+                self.fps_counter = 0
+            self.stream_info.set(f"{frame.shape[1]}×{frame.shape[0]} px · {self.stream_fps:.1f} кадров/с в интерфейсе · правая кнопка мыши: сброс ROI")
+
             if self.dark_pending > 0:
                 f = frame.astype(np.float64)
                 self.dark_accumulator = f if self.dark_accumulator is None else self.dark_accumulator + f
@@ -768,84 +701,23 @@ class App:
                     self.dark_image = (self.dark_accumulator / 16).astype(np.float32)
                     self.dark_accumulator = None
                     self.status("Тёмный кадр сохранён. Открой лазерный пучок при безопасном ослаблении.")
-            if camera_visible:
+            if now - self.last_processing_time >= .14 and self.dark_pending == 0:
+                self.analyze(frame)
+                self.last_processing_time = now
+            if now - self.last_display_time >= .07:
                 self.show_video(frame, self.last_result)
-                self.fps_counter += 1
-        self.collect_profile(camera_visible)
-        if camera_visible:
-            self.update_stream_rate(now)
-            if packet is not None:
-                self.request_profile(self.last_frame, now)
-        else:
-            self.fps_start = now
-            self.fps_counter = 0
-            self.stream_fps = 0.0
-        self.root.after(self.preview_tick_ms, self.tick)
-
-    def update_stream_rate(self, now):
-        if now - self.fps_start >= FPS_WINDOW_SECONDS:
-            self.stream_fps = self.fps_counter / (now - self.fps_start)
-            self.fps_start = now
-            self.fps_counter = 0
-        if self.last_frame is None:
-            return
-        height, width = self.last_frame.shape[:2]
-        source = "Демо" if self.demo else "Камера: —"
-        if not self.demo and self.camera_fps is not None:
-            source = f"Камера: {self.camera_fps:.1f} кадр/с"
-        message = f"{width}×{height} px · {source} · Превью: {self.stream_fps:.1f} кадр/с"
-        if self.stream_info.get() != message:
-            self.stream_info.set(message)
-
-    def profile_request(self, frame):
-        return ProfileRequest(self.profile_revision, frame, self.roi, self.channel.get(),
-                              self.dark_image, float(self.sat_level.get()))
-
-    def request_profile(self, frame, now):
-        if self.profile_pending or self.dark_pending or self.drag_start is not None or now < self.next_profile_time:
-            return
-        self.next_profile_time = now + self.profile_interval
-        try:
-            request = self.profile_request(frame)
-        except tk.TclError as exc:
-            self.apply_profile(exc)
-            return
-        self.profile_worker.requests.put_nowait(request)
-        self.profile_pending = True
-
-    def collect_profile(self, camera_visible):
-        try:
-            request, result = self.profile_worker.results.get_nowait()
-        except queue.Empty:
-            return
-        self.profile_pending = False
-        if not camera_visible or self.dark_pending or self.drag_start is not None:
-            return
-        if request.revision != self.profile_revision or request.dark_frame is not self.dark_image:
-            return
-        try:
-            if (request.roi != self.roi or request.channel != self.channel.get() or
-                    request.saturation_threshold != self.sat_level.get()):
-                return
-        except tk.TclError:
-            return
-        self.apply_profile(result)
+                self.last_display_time = now
+        self.root.after(35, self.tick)
 
     def analyze(self, frame):
-        # Explicit recording and export use the exact frame chosen by the user.
-        self.profile_revision += 1
-        self.next_profile_time = time.monotonic() + self.profile_interval
         try:
-            result = self.profile_request(frame).fit()
+            result = analyze_frame(frame, roi=self.roi,
+                                   mode=self.channel.get(), dark_frame=self.dark_image,
+                                   saturation_threshold=float(self.sat_level.get()))
         except (ValueError, TypeError, tk.TclError) as exc:
-            result = exc
-        self.apply_profile(result)
-
-    def apply_profile(self, result: BeamAnalysis | Exception):
-        if isinstance(result, Exception):
             self.last_result = None
             self.clear_measurement_metrics()
-            self.status(f"Измерение: {result}")
+            self.status(f"Измерение: {exc}")
             return
         self.last_result = result
         try:
@@ -881,17 +753,13 @@ class App:
             rgb = cv2.cvtColor(frame, cv2.COLOR_GRAY2RGB)
         else:
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        rgb = rgb.copy()
+        if result is not None and self.show_sat.get():
+            x0, y0, x1, y1 = result.roi
+            view = rgb[y0:y1, x0:x1]
+            # Solid red for pixels over clipping threshold.
+            view[result.saturated_mask] = (255, 36, 38)
         h, w = rgb.shape[:2]
-        if self.show_sat.get():
-            x0, y0, x1, y1 = self.roi or (0, 0, w, h)
-            try:
-                threshold = self.sat_level.get()
-            except tk.TclError:
-                pass
-            else:
-                channel = extract_channel(frame[y0:y1, x0:x1], self.channel.get())
-                view = rgb[y0:y1, x0:x1]
-                view[channel >= threshold] = (255, 36, 38)
         cw = max(self.video_canvas.winfo_width(), 2)
         ch = max(self.video_canvas.winfo_height(), 2)
         scale = min(cw / w, ch / h)
@@ -932,9 +800,7 @@ class App:
                 xx = fit.x * factor
                 ax.plot(xx, fit.y, color="#245c9e", linewidth=1.5, label="Данные")
                 ax.plot(xx, fit.fitted, color="#db612a", linestyle="--", linewidth=2,
-                        label="Гаусс + фон")
-                ax.plot(xx, fit.baseline, color="#697386", linestyle=":", linewidth=1.5,
-                        label="Линейный фон")
+                        label="Гаусс")
                 title = f"{label}: D = {fit.diameter_px * factor:.1f} {unit}"
                 if not result.fit_reliable:
                     title += " (недостоверно)"
@@ -962,7 +828,7 @@ class App:
         self.plot_canvas.draw_idle()
 
     def save_measurement(self):
-        if self.last_frame is None or self.dark_pending:
+        if self.last_frame is None or self.last_result is None or self.dark_pending:
             messagebox.showwarning("Нет данных", "Сначала получи кадр с камеры")
             return
         folder = filedialog.askdirectory(title="Папка для измерения")
@@ -1001,7 +867,7 @@ class App:
             "fit_reliable": result.fit_reliable,
             "warnings": result.warning,
             "background_level": result.background,
-            "profile_model": "Gaussian plus linear background",
+            "profile_model": "Gaussian plus constant background",
             "radius_x_px": result.x_fit.radius_px if result.x_fit else None,
             "radius_y_px": result.y_fit.radius_px if result.y_fit else None,
             "radius_x_um": result.x_fit.radius_px * pitch if pitch and result.x_fit else None,
@@ -1022,9 +888,9 @@ class App:
                 continue
             with open(str(base) + f"_profile_{tag}.csv", "w", newline="", encoding="utf-8-sig") as f:
                 writer = csv.writer(f)
-                writer.writerow(["coordinate_pixel", "coordinate_um", "intensity_sum", "gaussian_fit", "linear_background"])
-                for x, y, yf, baseline in zip(fit.x, fit.y, fit.fitted, fit.baseline):
-                    writer.writerow([float(x), float(x * pitch) if pitch else "", float(y), float(yf), float(baseline)])
+                writer.writerow(["coordinate_pixel", "coordinate_um", "intensity_sum", "gaussian_fit"])
+                for x, y, yf in zip(fit.x, fit.y, fit.fitted):
+                    writer.writerow([float(x), float(x * pitch) if pitch else "", float(y), float(yf)])
         self.refresh_plots(result, pitch)
         self.last_plot_time = time.monotonic()
         self.figure.savefig(str(base) + "_plots.png", dpi=160)
@@ -1033,10 +899,6 @@ class App:
     def on_close(self):
         self.stop_camera_worker()
         self.root.destroy()
-
-    def on_root_destroy(self, event):
-        if event.widget is self.root:
-            self.profile_worker.stop()
 
 
 def main():
