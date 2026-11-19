@@ -25,15 +25,23 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 
 from beam_math import BeamAnalysis, analyze_frame, extract_channel
+from propagation_tab import PropagationTab
 
 
-APP_TITLE = "USB Laser Beam Profiler | 780 nm"
+APP_TITLE = "USB Laser Beam Profiler"
 NO_CAMERA_READBACK = "Выдержка (Exposure): — · Усиление (Gain): —"
 
 
 def parse_optional_float(text: str) -> float | None:
     text = text.strip().replace(",", ".")
     return float(text) if text else None
+
+
+def parse_pixel_pitch(text: str) -> float | None:
+    pitch = parse_optional_float(text)
+    if pitch is not None and not 0 < pitch <= 1000:
+        raise ValueError("Масштаб должен быть положительным и <= 1000 мкм/px")
+    return pitch
 
 
 class CameraWorker(threading.Thread):
@@ -266,6 +274,9 @@ class App:
         self.resolution = tk.StringVar(value="1280×720")
         self.channel = tk.StringVar(value="Red")
         self.pixel_pitch = tk.StringVar(value="4,18")
+        self.wavelength_nm = tk.StringVar(value="780")
+        self.z_mm = tk.StringVar(value="0")
+        self.record_feedback = tk.StringVar(value="")
         self.sat_level = tk.IntVar(value=250)
         self.exposure = tk.StringVar(value="-12")
         self.gain = tk.StringVar(value="0")
@@ -294,7 +305,14 @@ class App:
         style.configure("Title.TLabel", font=("Segoe UI", 12, "bold"))
         style.configure("Metric.TLabel", font=("Segoe UI", 17, "bold"))
 
-        top = ttk.Frame(self.root, style="Top.TFrame", padding=10)
+        self.tabs = ttk.Notebook(self.root)
+        self.tabs.pack(fill=tk.BOTH, expand=True)
+        camera_tab = ttk.Frame(self.tabs, style="Top.TFrame")
+        self.tabs.add(camera_tab, text="Камера")
+        self.propagation_tab = PropagationTab(self.tabs, self.wavelength_nm)
+        self.tabs.add(self.propagation_tab, text="Фит пучка")
+
+        top = ttk.Frame(camera_tab, style="Top.TFrame", padding=10)
         top.pack(side=tk.TOP, fill=tk.X)
         for text, var, width in [
             ("Камера ID", self.cam_id, 4),
@@ -313,7 +331,7 @@ class App:
         ttk.Button(top, text="Тёмный кадр", command=self.capture_dark).pack(side=tk.LEFT, padx=7)
         ttk.Button(top, text="Сохранить PNG/CSV", command=self.save_measurement).pack(side=tk.LEFT, padx=3)
 
-        options = ttk.Frame(self.root, style="Top.TFrame", padding=(10, 0, 10, 10))
+        options = ttk.Frame(camera_tab, style="Top.TFrame", padding=(10, 0, 10, 10))
         options.pack(side=tk.TOP, fill=tk.X)
         ttk.Label(options, text="Канал", style="Top.TLabel").pack(side=tk.LEFT)
         ttk.Combobox(options, textvariable=self.channel, state="readonly", width=10,
@@ -326,7 +344,7 @@ class App:
         ttk.Checkbutton(options, text="ROI", variable=self.show_roi).pack(side=tk.LEFT, padx=6)
         ttk.Button(options, text="Сброс ROI", command=self.reset_roi).pack(side=tk.LEFT, padx=6)
 
-        exp_bar = ttk.Frame(self.root, style="Top.TFrame", padding=(10, 0, 10, 8))
+        exp_bar = ttk.Frame(camera_tab, style="Top.TFrame", padding=(10, 0, 10, 8))
         exp_bar.pack(side=tk.TOP, fill=tk.X)
         ttk.Label(exp_bar, text="Автоэкспозиция", style="Top.TLabel").pack(side=tk.LEFT)
         ttk.Button(exp_bar, text="Включить авто", command=lambda: self.request_auto_exposure(True)).pack(side=tk.LEFT, padx=5)
@@ -338,13 +356,24 @@ class App:
         ttk.Entry(exp_bar, textvariable=self.gain, width=7).pack(side=tk.LEFT, padx=5)
         ttk.Button(exp_bar, text="Задать", command=self.request_gain).pack(side=tk.LEFT)
 
-        readback_bar = ttk.Frame(self.root, style="Top.TFrame", padding=(10, 0, 10, 8))
+        readback_bar = ttk.Frame(camera_tab, style="Top.TFrame", padding=(10, 0, 10, 8))
         readback_bar.pack(side=tk.TOP, fill=tk.X)
         ttk.Label(readback_bar, textvariable=self.camera_readback, style="Top.TLabel").pack(anchor=tk.W)
         ttk.Label(readback_bar, textvariable=self.camera_control_result, style="Top.TLabel",
                   foreground="#667085").pack(anchor=tk.W)
 
-        content = ttk.Panedwindow(self.root, orient=tk.HORIZONTAL)
+        record_bar = ttk.Frame(camera_tab, style="Top.TFrame", padding=(10, 0, 10, 8))
+        record_bar.pack(side=tk.TOP, fill=tk.X)
+        ttk.Label(record_bar, text="Длина волны λ, нм", style="Top.TLabel").pack(side=tk.LEFT)
+        ttk.Entry(record_bar, textvariable=self.wavelength_nm, width=8).pack(side=tk.LEFT, padx=(5, 14))
+        ttk.Label(record_bar, text="z, мм", style="Top.TLabel").pack(side=tk.LEFT)
+        z_entry = ttk.Entry(record_bar, textvariable=self.z_mm, width=9)
+        z_entry.pack(side=tk.LEFT, padx=5)
+        z_entry.bind("<Return>", lambda _event: self.record_measurement())
+        ttk.Button(record_bar, text="Записать", command=self.record_measurement).pack(side=tk.LEFT, padx=(2, 10))
+        ttk.Label(record_bar, textvariable=self.record_feedback, style="Top.TLabel").pack(side=tk.LEFT)
+
+        content = ttk.Panedwindow(camera_tab, orient=tk.HORIZONTAL)
         content.pack(fill=tk.BOTH, expand=True, padx=9, pady=(0, 5))
         left = ttk.LabelFrame(content, text="Камера · потяни мышью для выбора ROI", style="Section.TLabelframe")
         right = ttk.LabelFrame(content, text="Профиль лазерного пучка", style="Section.TLabelframe")
@@ -368,7 +397,7 @@ class App:
         self.plot_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
         self.clear_plots()
 
-        metrics = ttk.Frame(self.root, style="Top.TFrame", padding=(12, 5))
+        metrics = ttk.Frame(camera_tab, style="Top.TFrame", padding=(12, 5))
         metrics.pack(fill=tk.X)
         for title, var in [("Радиус X (1/e²)", self.radius_x), ("Радиус Y (1/e²)", self.radius_y)]:
             cell = ttk.Frame(metrics, style="Top.TFrame")
@@ -379,7 +408,7 @@ class App:
         ttk.Label(metrics, textvariable=self.center_text, style="Top.TLabel").pack(side=tk.LEFT, padx=12)
         ttk.Label(metrics, textvariable=self.fit_text, style="Top.TLabel").pack(side=tk.LEFT, padx=12)
         ttk.Label(metrics, textvariable=self.sat_text, style="Top.TLabel").pack(side=tk.LEFT, padx=12)
-        ttk.Label(self.root, textvariable=self.status_text,
+        ttk.Label(camera_tab, textvariable=self.status_text,
                   background="#e0e7ef", foreground="#253247", anchor=tk.W,
                   padding=(12, 8)).pack(side=tk.BOTTOM, fill=tk.X)
 
@@ -388,6 +417,47 @@ class App:
 
     def status(self, message: str):
         self.status_text.set(message)
+
+    def record_measurement(self):
+        if self.last_frame is None or self.dark_pending:
+            self.record_feedback.set("Дождись кадра с текущим профилем пучка")
+            return
+        try:
+            wavelength = parse_optional_float(self.wavelength_nm.get())
+            if wavelength is None or not math.isfinite(wavelength) or wavelength <= 0:
+                raise ValueError()
+        except ValueError:
+            self.record_feedback.set("Укажи положительную длину волны в нм")
+            return
+        try:
+            z = parse_optional_float(self.z_mm.get())
+            if z is None or not math.isfinite(z):
+                raise ValueError()
+        except ValueError:
+            self.record_feedback.set("Укажи координату z в мм")
+            return
+        try:
+            pitch = parse_pixel_pitch(self.pixel_pitch.get())
+            if pitch is None:
+                raise ValueError()
+        except ValueError:
+            self.record_feedback.set("Укажи масштаб, чтобы записать диаметры в мкм")
+            return
+
+        self.analyze(self.last_frame)
+        result = self.last_result
+        if result is None or result.x_fit is None or result.y_fit is None:
+            self.record_feedback.set("На текущем кадре нужны оценки обоих диаметров")
+            return
+        reliable = result.fit_reliable and not self.demo
+        self.propagation_tab.add_measurement(z, result.x_fit.diameter_px * pitch,
+                                             result.y_fit.diameter_px * pitch, reliable)
+        message = "Записано во вкладку «Фит пучка»"
+        if self.demo:
+            message += " (демо)"
+        elif not reliable:
+            message += " (с предупреждением)"
+        self.record_feedback.set(message)
 
     def clear_plots(self):
         for ax, title in ((self.ax_x, "Профиль X"), (self.ax_y, "Профиль Y"),
@@ -651,9 +721,7 @@ class App:
             return
         self.last_result = result
         try:
-            pitch = parse_optional_float(self.pixel_pitch.get())
-            if pitch is not None and not 0 < pitch <= 1000:
-                raise ValueError("Масштаб должен быть положительным и <= 1000 мкм/px")
+            pitch = parse_pixel_pitch(self.pixel_pitch.get())
         except ValueError:
             pitch = None
             self.status("Неверный масштаб (мкм/px): показываю пиксели")
@@ -784,9 +852,7 @@ class App:
             return
         np.save(str(base) + "_background_subtracted.npy", result.corrected_roi)
         try:
-            pitch = parse_optional_float(self.pixel_pitch.get())
-            if pitch is not None and not 0 < pitch <= 1000:
-                pitch = None
+            pitch = parse_pixel_pitch(self.pixel_pitch.get())
         except ValueError:
             pitch = None
         summary = {
