@@ -59,13 +59,13 @@ def extract_channel(frame: np.ndarray, mode: str = "Red") -> np.ndarray:
         return frame.astype(np.float32)
     if frame.ndim != 3 or frame.shape[2] < 3:
         raise ValueError("Неподдерживаемый формат кадра")
-    b, g, r = (frame[..., i].astype(np.float32) for i in range(3))
     if mode == "Red":
-        return r
+        return frame[..., 2].astype(np.float32)
     if mode == "Green":
-        return g
+        return frame[..., 1].astype(np.float32)
     if mode == "Blue":
-        return b
+        return frame[..., 0].astype(np.float32)
+    b, g, r = (frame[..., i].astype(np.float32) for i in range(3))
     if mode == "Mean RGB":
         return (r + g + b) / 3.0
     if mode == "Gray":
